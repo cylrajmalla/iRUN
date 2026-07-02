@@ -1,0 +1,114 @@
+-- =============================================================================
+-- iRun Turf War — Initial Schema
+-- Target: PostgreSQL 14+ with PostGIS 3.x
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"; -- gen_random_uuid()
+
+-- -----------------------------------------------------------------------------
+-- USERS
+-- -----------------------------------------------------------------------------
+CREATE TABLE users (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username             VARCHAR(50) UNIQUE NOT NULL,
+    profile_picture_url  TEXT,
+    running_club         VARCHAR(100),
+    team_color           VARCHAR(7) NOT NULL DEFAULT '#FF5733', -- hex color for map rendering
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- -----------------------------------------------------------------------------
+-- RUNS — raw, immutable audit log of every submitted run.
+-- This is what we replay/inspect if a user disputes a ban, and what feeds
+-- the anti-spoofing review queue. It is never mutated by the capture logic.
+-- -----------------------------------------------------------------------------
+CREATE TABLE runs (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id                  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    raw_geom                 geometry(LineString, 4326) NOT NULL,
+    distance_meters          NUMERIC(10, 2) NOT NULL,
+    duration_seconds         INTEGER NOT NULL,
+    avg_pace_seconds_per_km  NUMERIC(8, 2) NOT NULL,
+    is_flagged_suspicious    BOOLEAN NOT NULL DEFAULT false,
+    flagged_reasons          TEXT[], -- e.g. {'IMPOSSIBLE_SPEED_SEGMENT','PACE_MISMATCH'}
+    started_at               TIMESTAMPTZ NOT NULL,
+    ended_at                 TIMESTAMPTZ NOT NULL,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_run_geom_valid CHECK (ST_IsValid(raw_geom)),
+    CONSTRAINT chk_run_time_order CHECK (ended_at > started_at)
+);
+
+CREATE INDEX idx_runs_user_id   ON runs (user_id);
+CREATE INDEX idx_runs_raw_geom  ON runs USING GIST (raw_geom);
+CREATE INDEX idx_runs_flagged   ON runs (is_flagged_suspicious) WHERE is_flagged_suspicious = true;
+
+-- -----------------------------------------------------------------------------
+-- TERRITORY_LINES — the live "painted" street segments that make up the map.
+-- Each row is a single simple LineString. Long runs get split into many rows
+-- over time as they are captured/sliced by other players.
+--
+-- Ownership state is derived, not stored:
+--   expires_at > now()  -> actively "owned" (rendered in team_color)
+--   expires_at <= now() -> "neutral" / gray, but NOT deleted — it stays
+--                          geometrically real so future runs can still
+--                          cleanly split/capture it instead of stacking
+--                          duplicate lines on the same street.
+-- A background job (see 003_expiry_cleanup.sql) purges long-neutral rows.
+-- -----------------------------------------------------------------------------
+CREATE TABLE territory_lines (
+    id                            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id                       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source_run_id                 UUID REFERENCES runs(id) ON DELETE SET NULL,
+    geom                          geometry(LineString, 4326) NOT NULL,
+    length_meters                 NUMERIC(10, 2) NOT NULL,
+    fastest_pace_seconds_per_km   NUMERIC(8, 2) NOT NULL,
+    created_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at                    TIMESTAMPTZ NOT NULL,
+
+    CONSTRAINT chk_territory_geom_valid  CHECK (ST_IsValid(geom)),
+    CONSTRAINT chk_territory_geom_simple CHECK (ST_IsSimple(geom)),
+    CONSTRAINT chk_territory_min_length  CHECK (length_meters >= 0)
+);
+
+-- The single most important index in this system: every capture check is
+-- "does anything intersect/lie within N meters of this new path". GIST on
+-- geom makes that a sub-millisecond bounding-box + exact-geometry lookup
+-- even with millions of rows.
+CREATE INDEX idx_territory_lines_geom        ON territory_lines USING GIST (geom);
+CREATE INDEX idx_territory_lines_user_id     ON territory_lines (user_id);
+CREATE INDEX idx_territory_lines_expires_at  ON territory_lines (expires_at);
+CREATE INDEX idx_territory_lines_source_run  ON territory_lines (source_run_id);
+
+-- Keep updated_at honest on every UPDATE.
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_territory_lines_updated_at
+    BEFORE UPDATE ON territory_lines
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER trg_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- -----------------------------------------------------------------------------
+-- Convenience view the map/tile endpoint reads from — bakes in the
+-- active-vs-neutral status so the frontend never has to compute it.
+-- -----------------------------------------------------------------------------
+CREATE VIEW territory_lines_with_status AS
+SELECT
+    tl.*,
+    u.username,
+    u.team_color,
+    CASE WHEN tl.expires_at > now() THEN 'active' ELSE 'neutral' END AS status
+FROM territory_lines tl
+JOIN users u ON u.id = tl.user_id;
